@@ -1,0 +1,30 @@
+# Configuración de ejemplo para wavepill
+# Copia este archivo a: ~/.config/wavepill/config.toml
+# Todos los campos son opcionales; si omites alguno (o si el archivo no existe),
+# wavepill usará sus valores por defecto.
+
+# Esquina de la pantalla donde se ancla el overlay.
+# Valores válidos: "top-right", "top-left", "bottom-right", "bottom-left"
+corner = "top-right"
+
+# Margen horizontal en píxeles desde el borde izquierdo o derecho.
+margin_x = 16
+
+# Margen vertical en píxeles desde el borde superior o inferior.
+margin_y = 48
+
+# Tiempo en milisegundos antes de ocultar la píldora tras detenerse el audio/reproducción.
+hide_delay_ms = 3000
+
+# Cantidad de barras del ecualizador de espectro.
+# Valores fuera de rango se ajustan automáticamente al intervalo [4, 32].
+bar_count = 12
+
+# Color de acento de las barras en formato hexadecimal "#RRGGBB".
+# Si el formato es inválido, vuelve al color por defecto ("#7aa2f7").
+accent_color = "#7aa2f7"
+
+# Lista de aplicaciones a ignorar (insensible a mayúsculas/minúsculas).
+# Coincide contra nombres de reproductor MPRIS o identidades de cliente PipeWire/PulseAudio.
+# Ejemplo: ignore_apps = ["firefox", "chromium"]
+ignore_apps = []
