@@ -11,6 +11,12 @@ window.wavepill-window {
     background-color: rgba(20, 22, 32, 0.88);
     border: 1px solid rgba(255, 255, 255, 0.14);
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.38);
+    cursor: grab;
+}
+
+.wavepill-capsule.dragging {
+    cursor: grabbing;
+    border-color: rgba(255, 255, 255, 0.28);
 }
 
 .wavepill-art {

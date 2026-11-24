@@ -20,11 +20,13 @@ pub enum IslandEvent {
     MediaUpdated(MediaSnapshot),
     PointerEntered,
     PointerLeft,
+    SetEnabled(bool),
+    DraggingChanged(bool),
     Tick(Instant),
 }
 
 /// Deterministic state machine coordinating audio activity, media playback,
-/// pointer hover, and delayed auto-hide behavior.
+/// pointer hover, drag state, enable toggle, and delayed auto-hide behavior.
 #[derive(Debug, Clone)]
 pub struct IslandStateMachine {
     state: VisibilityState,
@@ -32,6 +34,8 @@ pub struct IslandStateMachine {
     audio_active: bool,
     media_playing: bool,
     hovered: bool,
+    enabled: bool,
+    dragging: bool,
 }
 
 impl IslandStateMachine {
@@ -43,6 +47,8 @@ impl IslandStateMachine {
             audio_active: false,
             media_playing: false,
             hovered: false,
+            enabled: true,
+            dragging: false,
         }
     }
 
@@ -59,28 +65,62 @@ impl IslandStateMachine {
             }
             IslandEvent::PointerEntered => {
                 self.hovered = true;
-                if self.is_visible() {
+                if self.enabled && self.is_visible() {
                     self.state = VisibilityState::VisibleExpanded;
                 }
             }
             IslandEvent::PointerLeft => {
                 self.hovered = false;
-                match self.state {
-                    VisibilityState::Hidden => {}
-                    _ if self.is_active() => {
-                        self.state = VisibilityState::VisibleCompact;
-                    }
-                    VisibilityState::HidePending { since } => {
-                        self.state = VisibilityState::HidePending { since };
-                    }
-                    VisibilityState::VisibleCompact | VisibilityState::VisibleExpanded => {
-                        self.state = VisibilityState::HidePending { since: now };
+                if !self.enabled {
+                    self.state = VisibilityState::Hidden;
+                } else if self.dragging {
+                    // Keep visible while dragging; PointerLeft can fire if the pointer
+                    // momentarily outruns a layer-shell margin update.
+                } else {
+                    match self.state {
+                        VisibilityState::Hidden => {}
+                        _ if self.is_active() => {
+                            self.state = VisibilityState::VisibleCompact;
+                        }
+                        VisibilityState::HidePending { since } => {
+                            self.state = VisibilityState::HidePending { since };
+                        }
+                        VisibilityState::VisibleCompact | VisibilityState::VisibleExpanded => {
+                            self.state = VisibilityState::HidePending { since: now };
+                        }
                     }
                 }
             }
+            IslandEvent::SetEnabled(enabled) => {
+                self.enabled = enabled;
+                if !enabled {
+                    self.dragging = false;
+                    self.state = VisibilityState::Hidden;
+                } else {
+                    self.reconcile_activity(now);
+                }
+            }
+            IslandEvent::DraggingChanged(dragging) => {
+                self.dragging = dragging;
+                if !self.enabled {
+                    self.dragging = false;
+                    self.state = VisibilityState::Hidden;
+                } else if !dragging {
+                    self.reconcile_activity(now);
+                } else if let VisibilityState::HidePending { .. } = self.state {
+                    self.state = if self.hovered {
+                        VisibilityState::VisibleExpanded
+                    } else {
+                        VisibilityState::VisibleCompact
+                    };
+                }
+            }
             IslandEvent::Tick(tick_now) => {
-                if let VisibilityState::HidePending { since } = self.state
+                if !self.enabled {
+                    self.state = VisibilityState::Hidden;
+                } else if let VisibilityState::HidePending { since } = self.state
                     && !self.hovered
+                    && !self.dragging
                     && !self.is_active()
                     && tick_now.saturating_duration_since(since) >= self.hide_delay
                 {
@@ -113,11 +153,26 @@ impl IslandStateMachine {
         self.hovered
     }
 
+    /// Returns `true` when the overlay is enabled by the user.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns `true` while the user is actively dragging the island.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     fn is_active(&self) -> bool {
         self.audio_active || self.media_playing
     }
 
     fn reconcile_activity(&mut self, now: Instant) {
+        if !self.enabled {
+            self.state = VisibilityState::Hidden;
+            return;
+        }
+
         if self.is_active() {
             self.state = if self.hovered {
                 VisibilityState::VisibleExpanded
@@ -127,9 +182,13 @@ impl IslandStateMachine {
             return;
         }
 
-        if self.hovered {
+        if self.hovered || self.dragging {
             if self.is_visible() {
-                self.state = VisibilityState::VisibleExpanded;
+                self.state = if self.hovered {
+                    VisibilityState::VisibleExpanded
+                } else {
+                    VisibilityState::VisibleCompact
+                };
             }
             return;
         }

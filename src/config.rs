@@ -108,6 +108,44 @@ impl Config {
     pub fn hide_delay(&self) -> Duration {
         Duration::from_millis(self.hide_delay_ms)
     }
+
+    /// Saves the configuration to `~/.config/wavepill/config.toml`.
+    pub fn save_default(&self) -> std::io::Result<()> {
+        let path = Self::default_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not resolve XDG config directory",
+            )
+        })?;
+        self.save_to_path(&path)
+    }
+
+    /// Atomically serializes and writes the configuration to `path`.
+    pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let serialized = toml::to_string_pretty(self)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+
+        let tmp_name = format!(
+            ".{}.tmp.{}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("config.toml"),
+            std::process::id()
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        std::fs::write(&tmp_path, serialized)?;
+        if let Err(err) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

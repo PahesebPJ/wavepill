@@ -6,6 +6,7 @@ pub mod window;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc::Receiver as StdReceiver;
 use std::time::{Duration, Instant};
 
 use gtk4::{gdk, glib, prelude::*};
@@ -13,6 +14,7 @@ use tokio::sync::watch;
 
 use crate::audio::SpectrumFrame;
 use crate::config::Config;
+use crate::ipc::IpcEvent;
 use crate::media::{MediaCommand, MediaSnapshot, PlaybackStatus};
 use crate::state::{IslandEvent, IslandStateMachine};
 
@@ -57,11 +59,13 @@ pub fn run(
     config: Config,
     spectrum_rx: watch::Receiver<SpectrumFrame>,
     media_rx: watch::Receiver<MediaSnapshot>,
+    ipc_rx: StdReceiver<IpcEvent>,
     on_command: Box<dyn Fn(MediaCommand) + 'static>,
 ) -> glib::ExitCode {
     let app = gtk4::Application::builder().application_id(APP_ID).build();
     let on_command: Rc<dyn Fn(MediaCommand)> = Rc::from(on_command);
     let initialized = Rc::new(Cell::new(false));
+    let ipc_rx_slot = Rc::new(RefCell::new(Some(ipc_rx)));
 
     app.connect_activate(move |app| {
         if initialized.replace(true) {
@@ -73,6 +77,7 @@ pub fn run(
         let hold_guard = app.hold();
         let mut spectrum_rx = spectrum_rx.clone();
         let mut media_rx = media_rx.clone();
+        let ipc_rx = ipc_rx_slot.borrow_mut().take();
 
         let initial_frame = spectrum_rx.borrow_and_update().clone();
         let initial_snapshot = media_rx.borrow_and_update().clone();
@@ -109,8 +114,26 @@ pub fn run(
             }
         });
 
+        let drag_state = Rc::clone(&state);
+        let drag_handles = Rc::downgrade(&ui_handles);
+        let on_dragging: Rc<dyn Fn(bool)> = Rc::new(move |dragging| {
+            let (visible, expanded) = {
+                let mut st = drag_state.borrow_mut();
+                st.machine
+                    .handle(IslandEvent::DraggingChanged(dragging), Instant::now());
+                (st.machine.is_visible(), st.machine.is_expanded())
+            };
+
+            if let Some(handles) = drag_handles.upgrade()
+                && let Some((win, island)) = handles.get()
+            {
+                win.set_overlay_visible(visible);
+                island.set_expanded(expanded);
+            }
+        });
+
         let island = IslandWidget::new(&config, on_hover, Rc::clone(&on_command));
-        let window = WavepillWindow::new(app, &config, island.clone());
+        let window = WavepillWindow::new(app, &config, island.clone(), on_dragging);
 
         let _ = ui_handles.set((window.clone(), island.clone()));
 
@@ -139,6 +162,21 @@ pub fn run(
                 return glib::ControlFlow::Break;
             };
 
+            let mut reset_position_requested = false;
+            let mut ipc_enabled_events = Vec::new();
+            if let Some(rx) = ipc_rx.as_ref() {
+                while let Ok(evt) = rx.try_recv() {
+                    match evt {
+                        IpcEvent::SetEnabled(enabled) => ipc_enabled_events.push(enabled),
+                        IpcEvent::ResetPosition => reset_position_requested = true,
+                    }
+                }
+            }
+
+            if reset_position_requested {
+                timer_window.reset_position();
+            }
+
             let media_changed = media_rx.has_changed().unwrap_or(false);
             let spectrum_changed = spectrum_rx.has_changed().unwrap_or(false);
 
@@ -156,6 +194,10 @@ pub fn run(
             let (media_update, spectrum_update, visible, expanded) = {
                 let mut st = timer_state.borrow_mut();
                 let now = Instant::now();
+
+                for enabled in ipc_enabled_events {
+                    st.machine.handle(IslandEvent::SetEnabled(enabled), now);
+                }
 
                 if let Some(snapshot) = new_snapshot.as_ref() {
                     st.last_snapshot = snapshot.clone();

@@ -1,6 +1,7 @@
 use std::f32::consts::PI;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gtk4::RevealerTransitionType;
@@ -8,6 +9,10 @@ use gtk4_layer_shell::Edge;
 use wavepill::audio::SpectrumAnalyzer;
 use wavepill::audio::fft::{FFT_SIZE, SAMPLE_RATE};
 use wavepill::config::{Config, Corner, MAX_BAR_COUNT, MIN_BAR_COUNT};
+use wavepill::ipc::{
+    DaemonStatus, IpcCommand, IpcEvent, IpcServer, format_waybar_json, query_status_at,
+    send_command_to_path,
+};
 use wavepill::media::mpris::{
     MPRIS_BUS_PREFIX, MprisMetadata, MprisPlayer, is_mpris_app_ignored, player_to_snapshot,
     prioritize_players,
@@ -19,7 +24,7 @@ use wavepill::media::{ControlMode, MediaCommand, MediaSnapshot, PlaybackStatus};
 use wavepill::state::{IslandEvent, IslandStateMachine, VisibilityState};
 use wavepill::ui::equalizer::{EqualizerState, RgbColor};
 use wavepill::ui::island::{expanded_layout, format_media_labels, resolve_primary_control};
-use wavepill::ui::window::layer_placement;
+use wavepill::ui::window::{apply_drag_delta, layer_placement};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -42,24 +47,56 @@ impl Drop for TempConfigFile {
     }
 }
 
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("wavepill_it_dir_{pid}_{id}_{name}"));
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn sine_wave(freq_hz: f32, amplitude: f32, len: usize) -> Vec<f32> {
     (0..len)
         .map(|n| amplitude * (2.0 * PI * freq_hz * n as f32 / SAMPLE_RATE as f32).sin())
         .collect()
 }
 
-fn paused_mpris_snapshot(app_name: &str, title: &str, artist: &str) -> MediaSnapshot {
+fn mpris_snapshot(
+    status: PlaybackStatus,
+    app_name: &str,
+    title: &str,
+    artist: &str,
+) -> MediaSnapshot {
     MediaSnapshot {
         title: title.to_owned(),
         artist: artist.to_owned(),
         app_name: app_name.to_owned(),
         art_url: None,
-        status: PlaybackStatus::Paused,
+        status,
         control_mode: ControlMode::Mpris,
         can_go_next: true,
         can_go_previous: true,
         is_muted: false,
     }
+}
+
+fn paused_mpris_snapshot(app_name: &str, title: &str, artist: &str) -> MediaSnapshot {
+    mpris_snapshot(PlaybackStatus::Paused, app_name, title, artist)
+}
+
+fn playing_mpris_snapshot(app_name: &str, title: &str, artist: &str) -> MediaSnapshot {
+    mpris_snapshot(PlaybackStatus::Playing, app_name, title, artist)
 }
 
 #[test]
@@ -487,4 +524,493 @@ fn e2e_config_load_from_disk_drives_window_placement_and_expanded_layout() {
     assert_eq!(analyzer.bar_count(), 10);
     assert_eq!(equalizer.displayed_bars().len(), 10);
     assert_eq!(equalizer.color(), RgbColor::from_u8(0x9e, 0xce, 0x6a));
+}
+
+#[test]
+fn e2e_set_enabled_hides_immediately_blocks_reappearance_and_restores_with_active_audio() {
+    let config = Config::parse_toml(
+        r#"
+        hide_delay_ms = 1500
+        bar_count = 8
+        "#,
+    )
+    .expect("valid TOML config should parse");
+
+    let mut analyzer = SpectrumAnalyzer::new(config.bar_count);
+    let mut machine = IslandStateMachine::new(config.hide_delay());
+    let mut equalizer = EqualizerState::new(config.bar_count, &config.accent_color);
+
+    let t0 = Instant::now();
+    let audible_pcm = sine_wave(440.0, 0.7, FFT_SIZE);
+    let silent_pcm = vec![0.0_f32; FFT_SIZE];
+
+    // 1. Activate audio, playing media, hover, and drag so all active flags are engaged.
+    let frame = analyzer.process(&audible_pcm);
+    assert!(frame.is_audible);
+    assert_eq!(
+        machine.handle(IslandEvent::AudioActivity(frame.is_audible), t0),
+        VisibilityState::VisibleCompact
+    );
+    let playing = playing_mpris_snapshot("Spotify", "Resonance", "HOME");
+    assert_eq!(
+        machine.handle(IslandEvent::MediaUpdated(playing.clone()), t0),
+        VisibilityState::VisibleCompact
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::PointerEntered, t0),
+        VisibilityState::VisibleExpanded
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::DraggingChanged(true), t0),
+        VisibilityState::VisibleExpanded
+    );
+
+    equalizer.set_active(machine.is_visible());
+    equalizer.update_frame(&frame, false);
+    assert!(equalizer.tick());
+
+    // 2. Disabling must immediately hide the island and reset dragging even while audio/media play.
+    let t1 = t0 + Duration::from_millis(100);
+    assert_eq!(
+        machine.handle(IslandEvent::SetEnabled(false), t1),
+        VisibilityState::Hidden
+    );
+    assert!(!machine.is_visible());
+    assert!(!machine.is_enabled());
+    assert!(!machine.is_dragging());
+
+    equalizer.set_active(machine.is_visible());
+    assert!(!equalizer.is_active());
+
+    // 3. Reappearance must stay blocked across audio spikes, media updates, hover, drag, and ticks.
+    let t2 = t1 + Duration::from_millis(200);
+    let spike_frame = analyzer.process(&audible_pcm);
+    assert!(spike_frame.is_audible);
+    for event in [
+        IslandEvent::AudioActivity(false),
+        IslandEvent::AudioActivity(spike_frame.is_audible),
+        IslandEvent::MediaUpdated(playing.clone()),
+        IslandEvent::PointerEntered,
+        IslandEvent::DraggingChanged(true),
+        IslandEvent::Tick(t2 + Duration::from_secs(5)),
+    ] {
+        assert_eq!(machine.handle(event, t2), VisibilityState::Hidden);
+        assert!(!machine.is_visible());
+        assert!(!machine.is_dragging());
+    }
+
+    // 4. Re-enabling while audio/media are still active restores visibility immediately.
+    let t3 = t2 + Duration::from_millis(50);
+    assert_eq!(
+        machine.handle(IslandEvent::SetEnabled(true), t3),
+        VisibilityState::VisibleExpanded
+    );
+    assert!(machine.is_enabled());
+    assert!(machine.is_visible());
+
+    assert_eq!(
+        machine.handle(IslandEvent::PointerLeft, t3),
+        VisibilityState::VisibleCompact
+    );
+
+    // 5. If audio and media stop while disabled, re-enabling stays hidden until new audio arrives.
+    let t4 = t3 + Duration::from_millis(100);
+    assert_eq!(
+        machine.handle(IslandEvent::SetEnabled(false), t4),
+        VisibilityState::Hidden
+    );
+    let silent_frame = analyzer.process(&silent_pcm);
+    assert!(!silent_frame.is_audible);
+    assert_eq!(
+        machine.handle(IslandEvent::AudioActivity(silent_frame.is_audible), t4),
+        VisibilityState::Hidden
+    );
+    assert_eq!(
+        machine.handle(
+            IslandEvent::MediaUpdated(paused_mpris_snapshot("Spotify", "Resonance", "HOME")),
+            t4
+        ),
+        VisibilityState::Hidden
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::SetEnabled(true), t4),
+        VisibilityState::Hidden
+    );
+
+    let t5 = t4 + Duration::from_millis(100);
+    let resumed_frame = analyzer.process(&audible_pcm);
+    assert!(resumed_frame.is_audible);
+    assert_eq!(
+        machine.handle(IslandEvent::AudioActivity(resumed_frame.is_audible), t5),
+        VisibilityState::VisibleCompact
+    );
+}
+
+#[test]
+fn e2e_dragging_prevents_hide_during_hide_pending_and_pointer_left_then_resumes_normal_cycle() {
+    let config = Config::parse_toml("hide_delay_ms = 1000").expect("valid TOML config");
+    let mut analyzer = SpectrumAnalyzer::new(config.bar_count);
+    let mut machine = IslandStateMachine::new(config.hide_delay());
+    let mut equalizer = EqualizerState::new(config.bar_count, &config.accent_color);
+
+    let t0 = Instant::now();
+    let audible_pcm = sine_wave(660.0, 0.6, FFT_SIZE);
+    let silent_pcm = vec![0.0_f32; FFT_SIZE];
+
+    // 1. Bring capsule to VisibleExpanded, then drop audio and leave pointer to enter HidePending.
+    let audible_frame = analyzer.process(&audible_pcm);
+    assert_eq!(
+        machine.handle(IslandEvent::AudioActivity(audible_frame.is_audible), t0),
+        VisibilityState::VisibleCompact
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::PointerEntered, t0),
+        VisibilityState::VisibleExpanded
+    );
+    equalizer.set_active(machine.is_visible());
+
+    let t_silent = t0 + Duration::from_millis(100);
+    let silent_frame = analyzer.process(&silent_pcm);
+    assert!(!silent_frame.is_audible);
+    assert_eq!(
+        machine.handle(
+            IslandEvent::AudioActivity(silent_frame.is_audible),
+            t_silent
+        ),
+        VisibilityState::VisibleExpanded
+    );
+
+    let t_leave = t_silent + Duration::from_millis(50);
+    assert_eq!(
+        machine.handle(IslandEvent::PointerLeft, t_leave),
+        VisibilityState::HidePending { since: t_leave }
+    );
+
+    // 2. Starting drag during HidePending exits HidePending and prevents hiding past hide_delay.
+    let t_drag = t_leave + Duration::from_millis(500);
+    assert_eq!(
+        machine.handle(IslandEvent::DraggingChanged(true), t_drag),
+        VisibilityState::VisibleCompact
+    );
+    assert!(machine.is_dragging());
+    assert!(machine.is_visible());
+
+    let t_long_drag = t_drag + config.hide_delay() + Duration::from_secs(5);
+    assert_eq!(
+        machine.handle(IslandEvent::Tick(t_long_drag), t_long_drag),
+        VisibilityState::VisibleCompact
+    );
+
+    // 3. PointerEntered + PointerLeft while dragging (e.g., cursor outrunning margin updates)
+    // must keep the capsule visible and not start HidePending until drag ends.
+    assert_eq!(
+        machine.handle(IslandEvent::PointerEntered, t_long_drag),
+        VisibilityState::VisibleExpanded
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::PointerLeft, t_long_drag),
+        VisibilityState::VisibleExpanded
+    );
+    assert!(machine.is_dragging());
+    assert!(machine.is_visible());
+
+    let t_still_dragging = t_long_drag + config.hide_delay() + Duration::from_secs(2);
+    assert_eq!(
+        machine.handle(IslandEvent::Tick(t_still_dragging), t_still_dragging),
+        VisibilityState::VisibleExpanded
+    );
+
+    // 4. Releasing drag while silent and unhovered resumes the normal HidePending -> Hidden cycle.
+    let t_drop = t_still_dragging + Duration::from_millis(100);
+    assert_eq!(
+        machine.handle(IslandEvent::DraggingChanged(false), t_drop),
+        VisibilityState::HidePending { since: t_drop }
+    );
+    assert!(!machine.is_dragging());
+    assert!(machine.is_visible());
+
+    let t_just_before = t_drop + config.hide_delay() - Duration::from_millis(1);
+    assert_eq!(
+        machine.handle(IslandEvent::Tick(t_just_before), t_just_before),
+        VisibilityState::HidePending { since: t_drop }
+    );
+
+    let t_expired = t_drop + config.hide_delay();
+    assert_eq!(
+        machine.handle(IslandEvent::Tick(t_expired), t_expired),
+        VisibilityState::Hidden
+    );
+    assert!(!machine.is_visible());
+    equalizer.set_active(machine.is_visible());
+    assert!(!equalizer.is_active());
+
+    // 5. Releasing drag while audio is active resumes VisibleCompact without hiding.
+    let t_reopen = t_expired + Duration::from_millis(100);
+    let reopened = analyzer.process(&audible_pcm);
+    assert_eq!(
+        machine.handle(IslandEvent::AudioActivity(reopened.is_audible), t_reopen),
+        VisibilityState::VisibleCompact
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::DraggingChanged(true), t_reopen),
+        VisibilityState::VisibleCompact
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::PointerLeft, t_reopen),
+        VisibilityState::VisibleCompact
+    );
+    assert_eq!(
+        machine.handle(IslandEvent::DraggingChanged(false), t_reopen),
+        VisibilityState::VisibleCompact
+    );
+    assert_eq!(
+        machine.handle(
+            IslandEvent::Tick(t_reopen + config.hide_delay() + Duration::from_secs(1)),
+            t_reopen + config.hide_delay() + Duration::from_secs(1)
+        ),
+        VisibilityState::VisibleCompact
+    );
+}
+
+#[test]
+fn e2e_drag_delta_persists_through_config_save_and_load_for_all_corners() {
+    struct CornerCase {
+        name: &'static str,
+        corner: Corner,
+        initial: (i32, i32),
+        delta: (i32, i32),
+        max_bounds: (i32, i32),
+        expected: (i32, i32),
+        clamped_zero_delta: (i32, i32),
+        v_edge: Edge,
+        h_edge: Edge,
+    }
+
+    let cases = [
+        CornerCase {
+            name: "top-right",
+            corner: Corner::TopRight,
+            initial: (40, 60),
+            delta: (-35, 25),
+            max_bounds: (1920, 1080),
+            expected: (75, 85),
+            clamped_zero_delta: (500, -500),
+            v_edge: Edge::Top,
+            h_edge: Edge::Right,
+        },
+        CornerCase {
+            name: "top-left",
+            corner: Corner::TopLeft,
+            initial: (16, 48),
+            delta: (24, -18),
+            max_bounds: (1920, 1080),
+            expected: (40, 30),
+            clamped_zero_delta: (-500, -500),
+            v_edge: Edge::Top,
+            h_edge: Edge::Left,
+        },
+        CornerCase {
+            name: "bottom-right",
+            corner: Corner::BottomRight,
+            initial: (20, 30),
+            delta: (-30, -45),
+            max_bounds: (1920, 1080),
+            expected: (50, 75),
+            clamped_zero_delta: (500, 500),
+            v_edge: Edge::Bottom,
+            h_edge: Edge::Right,
+        },
+        CornerCase {
+            name: "bottom-left",
+            corner: Corner::BottomLeft,
+            initial: (10, 20),
+            delta: (5000, -5000),
+            max_bounds: (800, 600),
+            expected: (800, 600),
+            clamped_zero_delta: (-5000, 5000),
+            v_edge: Edge::Bottom,
+            h_edge: Edge::Left,
+        },
+    ];
+
+    let temp_root = TempDir::new("drag_roundtrip");
+
+    for case in cases {
+        let mut config = Config {
+            corner: case.corner,
+            margin_x: case.initial.0,
+            margin_y: case.initial.1,
+            hide_delay_ms: 2200,
+            bar_count: 16,
+            accent_color: "#f7768e".to_owned(),
+            ignore_apps: vec!["zen".to_owned(), "vlc".to_owned()],
+        };
+
+        let (next_x, next_y) = apply_drag_delta(
+            config.corner,
+            (config.margin_x, config.margin_y),
+            case.delta,
+            case.max_bounds,
+        );
+        assert_eq!((next_x, next_y), case.expected, "corner {}", case.name);
+
+        config.margin_x = next_x;
+        config.margin_y = next_y;
+
+        let config_path = temp_root.path.join(case.name).join("config.toml");
+        config
+            .save_to_path(&config_path)
+            .expect("config.save_to_path should create parent dirs and persist TOML");
+
+        let loaded = Config::load_from_path(&config_path);
+        assert_eq!(loaded, config, "round-trip mismatch for {}", case.name);
+
+        let placement = layer_placement(loaded.corner, loaded.margin_x, loaded.margin_y);
+        assert_eq!(placement.vertical_edge, case.v_edge);
+        assert_eq!(placement.horizontal_edge, case.h_edge);
+        assert_eq!(placement.horizontal_margin, case.expected.0);
+        assert_eq!(placement.vertical_margin, case.expected.1);
+
+        // Also verify clamping to 0 persists cleanly across a second save/load pass.
+        let zeroed = apply_drag_delta(
+            loaded.corner,
+            (loaded.margin_x, loaded.margin_y),
+            case.clamped_zero_delta,
+            case.max_bounds,
+        );
+        assert_eq!(zeroed, (0, 0), "zero clamp mismatch for {}", case.name);
+
+        let mut reset_cfg = loaded;
+        reset_cfg.margin_x = zeroed.0;
+        reset_cfg.margin_y = zeroed.1;
+        reset_cfg
+            .save_to_path(&config_path)
+            .expect("overwrite save_to_path should succeed");
+        let reloaded = Config::load_from_path(&config_path);
+        assert_eq!((reloaded.margin_x, reloaded.margin_y), (0, 0));
+    }
+}
+
+#[test]
+fn e2e_ipc_server_commands_status_waybar_json_and_state_machine_flow() {
+    let sock_file = TempConfigFile::new("ipc_e2e.sock");
+    let sock_path = sock_file.path.clone();
+
+    // 1. Before daemon starts, status is Stopped and Waybar JSON reflects stopped state.
+    let stopped_status = query_status_at(&sock_path);
+    assert_eq!(stopped_status, DaemonStatus::Stopped);
+    let stopped_json = format_waybar_json(stopped_status);
+    assert!(!stopped_json.contains('\n'));
+    assert!(stopped_json.starts_with('{') && stopped_json.ends_with('}'));
+    assert!(stopped_json.contains("\"class\":\"stopped\""));
+    assert!(stopped_json.contains("\"text\":"));
+    assert!(stopped_json.contains("\"tooltip\":"));
+
+    // 2. Start IPC server with daemon enabled and an active audio stream driving the island.
+    let enabled = Arc::new(AtomicBool::new(true));
+    let (server, rx) = IpcServer::start_at(sock_path.clone(), Arc::clone(&enabled));
+    let mut server = server.expect("IpcServer::start_at should bind socket");
+
+    let mut analyzer = SpectrumAnalyzer::new(12);
+    let mut machine = IslandStateMachine::new(Duration::from_millis(2000));
+    let t0 = Instant::now();
+    let frame = analyzer.process(&sine_wave(440.0, 0.7, FFT_SIZE));
+    assert!(frame.is_audible);
+    assert_eq!(
+        machine.handle(IslandEvent::AudioActivity(frame.is_audible), t0),
+        VisibilityState::VisibleCompact
+    );
+
+    let initial_status = query_status_at(&sock_path);
+    assert_eq!(initial_status, DaemonStatus::Enabled);
+    let enabled_json = format_waybar_json(initial_status);
+    assert!(!enabled_json.contains('\n'));
+    assert!(enabled_json.contains("\"class\":\"enabled\""));
+
+    // 3. Disable via IPC -> updates status, Waybar JSON, and hides the state machine immediately.
+    assert_eq!(
+        send_command_to_path(&sock_path, IpcCommand::Disable)
+            .expect("disable command should succeed"),
+        "disabled"
+    );
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected SetEnabled(false) IPC event");
+    assert_eq!(evt, IpcEvent::SetEnabled(false));
+    if let IpcEvent::SetEnabled(flag) = evt {
+        assert_eq!(
+            machine.handle(
+                IslandEvent::SetEnabled(flag),
+                t0 + Duration::from_millis(50)
+            ),
+            VisibilityState::Hidden
+        );
+    }
+
+    let disabled_status = query_status_at(&sock_path);
+    assert_eq!(disabled_status, DaemonStatus::Disabled);
+    let disabled_json = format_waybar_json(disabled_status);
+    assert!(!disabled_json.contains('\n'));
+    assert!(disabled_json.contains("\"class\":\"disabled\""));
+
+    // 4. Toggle via IPC -> re-enables and restores island visibility since audio is active.
+    assert_eq!(
+        send_command_to_path(&sock_path, IpcCommand::Toggle)
+            .expect("toggle command should succeed"),
+        "enabled"
+    );
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected SetEnabled(true) IPC event");
+    assert_eq!(evt, IpcEvent::SetEnabled(true));
+    if let IpcEvent::SetEnabled(flag) = evt {
+        assert_eq!(
+            machine.handle(
+                IslandEvent::SetEnabled(flag),
+                t0 + Duration::from_millis(100)
+            ),
+            VisibilityState::VisibleCompact
+        );
+    }
+    assert_eq!(query_status_at(&sock_path), DaemonStatus::Enabled);
+
+    // 5. Toggle back off, then explicit Enable, then ResetPos.
+    assert_eq!(
+        send_command_to_path(&sock_path, IpcCommand::Toggle).expect("second toggle should succeed"),
+        "disabled"
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        IpcEvent::SetEnabled(false)
+    );
+    assert_eq!(
+        send_command_to_path(&sock_path, IpcCommand::Enable)
+            .expect("enable command should succeed"),
+        "enabled"
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        IpcEvent::SetEnabled(true)
+    );
+    assert_eq!(
+        send_command_to_path(&sock_path, IpcCommand::ResetPos)
+            .expect("reset-pos command should succeed"),
+        "ok"
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        IpcEvent::ResetPosition
+    );
+    assert_eq!(
+        send_command_to_path(&sock_path, IpcCommand::Status)
+            .expect("status command should succeed"),
+        "enabled"
+    );
+
+    // 6. Stopping the server cleans up the socket and restores Stopped Waybar JSON.
+    server.stop();
+    assert!(!sock_path.exists());
+    let final_status = query_status_at(&sock_path);
+    assert_eq!(final_status, DaemonStatus::Stopped);
+    assert!(format_waybar_json(final_status).contains("\"class\":\"stopped\""));
 }
