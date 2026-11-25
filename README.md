@@ -2,16 +2,21 @@
 
 Overlay nativo para Wayland/Hyprland estilo *Dynamic Island* escrito en Rust con **GTK4**, `gtk4-layer-shell`, **PipeWire** (vía compatibilidad PulseAudio) y **MPRIS** sobre D-Bus.
 
-## Propósito y arquitectura
+## Características
 
-`wavepill` permanece oculto hasta detectar actividad de audio o reproducción multimedia, mostrando una píldora flotante en una esquina de la pantalla con un ecualizador de espectro en tiempo real y controles/metadatos MPRIS sin robar el foco del teclado (`KeyboardMode::None`, namespace `wavepill`).
+- **Cápsula *Dynamic Island* sin robar foco:** Anclada mediante `gtk4-layer-shell` (`Layer::Overlay`, `KeyboardMode::None`, namespace `wavepill`).
+- **Ecualizador de espectro en tiempo real:** Captura directa de `@DEFAULT_MONITOR@` en PipeWire procesada con ventana de Hann + `rustfft` en 12 bandas logarítmicas a ~60 FPS en Cairo (timer bajo demanda, ~0% CPU cuando está oculta).
+- **Control híbrido MPRIS + PipeWire:** Detecta reproductores MPRIS (Spotify, navegador, VLC, etc.) con carátula, título, artista y `Play/Pause`, `Previous`, `Next`; y hace fallback automático a *sink-inputs* de PipeWire (Mute/Unmute) para apps sin MPRIS.
+- **Arrastre libre con el mouse:** Arrastra la cápsula con clic izquierdo a cualquier punto del monitor; la nueva posición (`margin_x`, `margin_y`) se guarda automáticamente en `~/.config/wavepill/config.toml`.
+- **Control IPC y CLI para Waybar / atajos:** Activa, desactiva, consulta estado JSON o restablece la posición desde terminal o desde tu barra superior.
 
 ```mermaid
 flowchart LR
-    PW["PipeWire / pipewire-pulse"] -->|"FFT + espectro"| UI["GTK4 + gtk4-layer-shell (overlay)"]
+    PW["PipeWire / pipewire-pulse"] -->|"FFT + espectro + fallback"| UI["GTK4 + gtk4-layer-shell (overlay)"]
     DBUS["D-Bus MPRIS"] -->|"Metadatos y estado"| UI
-    UI -->|"Comandos Play/Pause/Prev/Next"| DBUS
-    CFG["~/.config/wavepill/config.toml"] -->|"Configuración"| UI
+    UI -->|"Play/Pause/Prev/Next/Mute"| DBUS
+    IPC["CLI / Waybar (Unix socket)"] -->|"toggle / reset-pos / status"| UI
+    CFG["~/.config/wavepill/config.toml"] <-->|"Configuración y posición"| UI
 ```
 
 ## Requisitos en Arch Linux
@@ -41,9 +46,21 @@ RUST_LOG=info ./target/release/wavepill
 
 Si omites `RUST_LOG`, `wavepill` utiliza `wavepill=info` por defecto. Para detenerlo, presiona `Ctrl+C` en la terminal.
 
+## Comandos CLI / IPC
+
+Mientras `wavepill` está corriendo (escuchando en `$XDG_RUNTIME_DIR/wavepill.sock`), puedes controlarlo desde otra terminal, Waybar o un atajo de Hyprland:
+
+```bash
+./target/release/wavepill toggle     # Activa/desactiva la cápsula (o inicia el daemon si está detenido)
+./target/release/wavepill enable     # Activa la aparición de la cápsula
+./target/release/wavepill disable    # Oculta y desactiva la cápsula hasta volver a habilitarla
+./target/release/wavepill reset-pos  # Restablece la posición a la esquina por defecto (16, 48)
+./target/release/wavepill status     # Imprime JSON compatible con Waybar (enabled/disabled/stopped)
+```
+
 ## Configuración
 
-`wavepill` busca su archivo de configuración en:
+`wavepill` busca (y guarda al arrastrar) su archivo de configuración en:
 
 ```text
 ~/.config/wavepill/config.toml
@@ -70,12 +87,38 @@ cp config.example.toml ~/.config/wavepill/config.toml
 
 Si el archivo no existe, `wavepill` arranca con los valores por defecto. Si contiene errores de sintaxis o tipos inválidos, registra una advertencia (`tracing::warn`) y aplica la configuración por defecto.
 
-## Integración con Hyprland (cuando quieras automatizarlo)
+## Integración con Waybar (opcional)
 
-> [!TIP]
-> Esta integración es **completamente opcional**. Puedes seguir lanzando `wavepill` manualmente desde terminal mientras lo pruebas.
+Añade `"custom/wavepill"` a tu lista de módulos en `~/.config/waybar/config.jsonc` (requiere Nerd Font para los íconos `󱑽` / `󰎊`):
 
-Cuando quieras iniciarlo automáticamente con tu sesión de Hyprland y aplicar reglas al namespace `wavepill` de `gtk4-layer-shell`, añade lo siguiente en tu configuración de Hyprland (por ejemplo `~/.config/hypr/autostart.conf` y tu archivo de reglas de ventana/capa):
+```jsonc
+"custom/wavepill": {
+  "exec": "/ruta/a/wavepill status",
+  "return-type": "json",
+  "signal": 11,
+  "interval": 5,
+  "on-click": "/ruta/a/wavepill toggle",
+  "on-click-right": "/ruta/a/wavepill reset-pos"
+}
+```
+
+Y en `~/.config/waybar/style.css`:
+
+```css
+#custom-wavepill {
+  min-width: 12px;
+  margin: 0 7.5px;
+}
+
+#custom-wavepill.disabled,
+#custom-wavepill.stopped {
+  opacity: 0.45;
+}
+```
+
+## Integración con Hyprland (opcional)
+
+Cuando quieras iniciarlo automáticamente con tu sesión de Hyprland y aplicar reglas al namespace `wavepill`:
 
 ```ini
 # ~/.config/hypr/autostart.conf (opcional)
@@ -93,8 +136,12 @@ layerrule = ignorezero, wavepill
 
 ## Verificación
 
-Para ejecutar la suite de pruebas unitarias (incluyendo el parser y los valores por defecto de configuración):
+Para ejecutar toda la suite de pruebas (unitarias + integración E2E):
 
 ```bash
 cargo test
 ```
+
+## Licencia
+
+Distribuido bajo licencia [MIT](./LICENSE).
